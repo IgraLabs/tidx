@@ -33,7 +33,7 @@
 - [Configuration](#configuration)
 - [CLI](#cli)
 - [HTTP API](#http-api)
-- [Database Schema](#database-schema)
+- [Tables](#tables)
 - [Sync Architecture](#sync-architecture)
 - [Development](#development)
 - [License](#license)
@@ -377,7 +377,7 @@ curl "https://tidx.example.com/views?chainId=42431"
   "ok": true,
   "views": [
     {
-      "name": "token_holders",
+      "name": "whale_holders",
       "engine": "MaterializedView",
       "database": "analytics_42431",
       "columns": [
@@ -397,7 +397,7 @@ curl -X POST "https://tidx.example.com/views" \
   -H "Content-Type: application/json" \
   -d '{
     "chainId": 42431,
-    "name": "token_holders",
+    "name": "whale_holders",
     "sql": "SELECT token, holder, sum(balance) AS balance FROM token_balances GROUP BY token, holder HAVING balance > 0",
     "orderBy": ["token", "holder"]
   }'
@@ -419,14 +419,14 @@ This creates:
 #### Get View Details
 
 ```bash
-curl "https://tidx.example.com/views/token_holders?chainId=42431"
+curl "https://tidx.example.com/views/whale_holders?chainId=42431"
 ```
 
 ```json
 {
   "ok": true,
-  "view": {"name": "token_holders", "engine": "View", "database": "analytics_42431"},
-  "definition": "CREATE VIEW analytics_42431.token_holders AS SELECT ...",
+  "view": {"name": "whale_holders", "engine": "View", "database": "analytics_42431"},
+  "definition": "CREATE VIEW analytics_42431.whale_holders AS SELECT ...",
   "row_count": 1234567
 }
 ```
@@ -434,13 +434,13 @@ curl "https://tidx.example.com/views/token_holders?chainId=42431"
 #### Delete View (trusted IP only)
 
 ```bash
-curl -X DELETE "https://tidx.example.com/views/token_holders?chainId=42431"
+curl -X DELETE "https://tidx.example.com/views/whale_holders?chainId=42431"
 ```
 
 ```json
 {
   "ok": true,
-  "deleted": ["token_holders_mv", "token_holders"]
+  "deleted": ["token_holders_mv", "whale_holders"]
 }
 ```
 
@@ -450,14 +450,22 @@ Views are auto-prefixed with `analytics_{chainId}` when using `engine=clickhouse
 
 ```bash
 # Query the view (auto-prefixed)
-curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM token_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
+curl "https://tidx.example.com/query?chainId=42431&engine=clickhouse&sql=SELECT * FROM whale_holders WHERE token = '0x...' ORDER BY balance DESC LIMIT 10"
 ```
 
-## Schemas
+## Tables
 
-All tables use composite primary keys with timestamps for efficient range queries:
+Three families of tables are queryable through `/query`:
 
-### blocks
+- **[Base Tables](#base-tables)** — raw chain data written by the sync engine, available in both PostgreSQL and ClickHouse.
+- **[Event Tables](#event-tables)** — virtual, decoded-at-query-time tables generated from `?signature=Event(...)`. Available in both engines.
+- **[Materialized Tables](#materialized-tables)** — precomputed, address- and token-keyed views maintained by ClickHouse on insert. Available only with `engine=clickhouse`. Includes built-ins (token transfers/balances/supply/approvals/metadata, address transfers/balances/txs, contract creations) plus any user-defined views registered through the [`/views` API](#views-api).
+
+### Base Tables
+
+Written by the sync engine to both PostgreSQL and ClickHouse. Schemas are identical across engines; the per-table column names below are the source of truth.
+
+#### blocks
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -472,7 +480,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `extra_data` | `BYTEA` | Extra data field |
 | `consensus_proposer` | `BYTEA` | Ed25519 consensus proposer pubkey (TIP-1031, NULL pre-fork) |
 
-### txs
+#### txs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -498,7 +506,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `valid_after` | `INT8` | Validity window end |
 | `signature_type` | `INT2` | Signature type |
 
-### logs
+#### logs
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -512,7 +520,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `topics` | `BYTEA[]` | All topics |
 | `data` | `BYTEA` | Event data |
 
-### receipts
+#### receipts
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -529,7 +537,7 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `status` | `INT2` | Success (1) or failure (0) |
 | `fee_payer` | `BYTEA` | Tempo fee payer (if sponsored) |
 
-### sync_state
+#### sync_state
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -540,6 +548,452 @@ All tables use composite primary keys with timestamps for efficient range querie
 | `backfill_num` | `INT8` | Lowest synced block going backwards (NULL=not started, 0=complete) |
 | `started_at` | `TIMESTAMPTZ` | Sync start time |
 | `updated_at` | `TIMESTAMPTZ` | Last update time |
+
+### Event Tables
+
+Pass `?signature=Event(type1,type2,...)` to `/query` and tidx exposes a virtual table named after the event with one column per parameter. The table is generated as a CTE at query time, so no schema registration is needed and any event signature works on demand. Works against both `engine=postgres` and `engine=clickhouse`:
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=4217" \
+  --data-urlencode "signature=Transfer(address,address,uint256)" \
+  --data-urlencode "sql=SELECT \"from\", \"to\", value
+    FROM Transfer
+    WHERE \"from\" = '0xabc…'
+    ORDER BY block_num DESC
+    LIMIT 10"
+```
+
+For Transfer logs specifically, [`token_transfers`](#token_transfers) is pre-decoded and cheaper.
+
+### Materialized Tables
+
+> [!NOTE]
+> All tables in this section are ClickHouse-only. Query them with `engine=clickhouse`.
+
+ClickHouse maintains these on insert and prunes them on reorg. Token-keyed tables answer "for this token, …"; address-keyed tables answer "for this account, …". Both families read from the same underlying Transfer/tx/receipt streams — the duplication exists so that either filter resolves via a sort-key seek instead of a full scan.
+
+| Name | Purpose |
+|------|---------|
+| [`address_balances`](#address_balances) | Current positive balance per `(holder, token)`. |
+| [`address_holder_deltas`](#address_holder_deltas) | Holder-first mirror of `token_holder_deltas`. |
+| [`address_transfers`](#address_transfers) | Transfer feed keyed by account; `'in'`/`'out'`. |
+| [`address_txs`](#address_txs) | Tx feed keyed by account; `'from'`/`'to'`. |
+| [`contract_creations`](#contract_creations) | One row per contract deployment. |
+| [`token_approvals`](#token_approvals) | Decoded `Approval` events. |
+| [`token_approvals_current`](#token_approvals_current) | Latest allowance per `(token, owner, spender)`. |
+| [`token_balances`](#token_balances) | Current positive balance per `(token, holder)`. |
+| [`token_holder_deltas`](#token_holder_deltas) | Per-event ± balance change, two rows per transfer. |
+| [`token_metadata`](#token_metadata) | Per-token first/last seen + lifetime transfer count. |
+| [`token_supply`](#token_supply) | Per-token mints − burns (zero-address legs). |
+| [`token_transfer_stats`](#token_transfer_stats) | Per-`(day, token)` count, volume, unique senders/recipients. |
+| [`token_transfers`](#token_transfers) | Decoded `Transfer` events. |
+
+User-defined views registered through the [`/views` API](#views-api) live alongside these in `analytics_{chainId}` and are queryable the same way.
+
+#### address_balances
+
+> [!NOTE]
+> View over `address_holder_deltas FINAL`, grouped by `(holder, token)`.
+
+Current positive balances grouped by holder first — answers "what does this address hold?" in one sort-key range. `token_balances` answers the inverse "who holds this token?" — same underlying transfer events, two different sort orders.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
+| `balance` | `Int256` | Current balance (positive only) |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, toString(balance) AS balance
+    FROM address_balances
+    WHERE holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY balance DESC"
+```
+
+#### address_holder_deltas
+
+> [!NOTE]
+> Materialized view over `token_transfers`, kept in sync on reorg.
+
+Same deltas as `token_holder_deltas` but ordered `(holder, token, block_num, …)` so per-holder balance reconstructions are a sort-key seek. Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `holder` | `String` | Holder address |
+| `token` | `String` | Token contract |
+| `leg` | `Int8` | `+1` for credit, `-1` for debit |
+| `balance_delta` | `Int256` | Signed delta applied to `(holder, token)` |
+
+#### address_transfers
+
+> [!NOTE]
+> Materialized view over `token_transfers`, kept in sync on reorg.
+
+Address-keyed Transfer feed. Each `Transfer` produces up to two rows (one per non-zero side): an `'in'` row for the recipient and an `'out'` row for the sender. `ReplacingMergeTree` ordered by `(address, block_num, log_idx, tx_hash, direction)` so per-address pagination is a sort-key seek instead of a full scan. Zero-address legs are dropped — mints show up only on the recipient's `'in'` side, burns only on the sender's `'out'` side.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | The account this row is scoped to |
+| `direction` | `LowCardinality(String)` | `'in'` or `'out'` from `address`'s perspective |
+| `counterparty` | `String` | The other side of the transfer (may be `0x0`) |
+| `token` | `String` | Emitting token contract |
+| `amount` | `UInt256` | Transfer amount |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, direction, counterparty, token, toString(amount) AS amount
+    FROM address_transfers
+    WHERE address = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 5"
+```
+
+#### address_txs
+
+> [!NOTE]
+> Materialized view over `txs`, kept in sync on reorg.
+
+Address-keyed transaction feed. Each tx produces one row per non-null side (sender always emits an `'from'` row; recipient emits a `'to'` row when `to` is non-null). `ReplacingMergeTree` ordered by `(address, block_num, tx_idx, direction)` so `/addresses/:address/transactions` and the `direction=from|to|both` filter resolve via a sort-key seek.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `tx_hash` | `String` | Transaction hash |
+| `address` | `String` | The account this row is scoped to |
+| `direction` | `LowCardinality(String)` | `'from'` (this address sent) or `'to'` (this address was the recipient) |
+| `counterparty` | `Nullable(String)` | The other side, NULL when the source tx had no `to` (contract deploy) |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, direction, tx_hash, counterparty
+    FROM address_txs
+    WHERE address = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+      AND direction = 'from'
+    ORDER BY block_num DESC, tx_idx DESC
+    LIMIT 5"
+```
+
+#### contract_creations
+
+> [!NOTE]
+> Materialized view over `receipts`, kept in sync on reorg.
+
+One row per contract deployment, derived from receipts where `contract_address` is set. Ordered by `(creator, block_num, tx_idx)` so "what contracts did this address deploy?" is a sort-key seek.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `tx_hash` | `String` | Transaction hash |
+| `creator` | `String` | Deployer address (`receipts.from`) |
+| `contract` | `String` | Deployed contract address |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT contract, block_num, tx_hash
+    FROM contract_creations
+    WHERE creator = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY block_num DESC, tx_idx DESC
+    LIMIT 5"
+```
+#### token_approvals
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+One row per canonical `Approval(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`. Stores raw approval events — to get the latest allowance per `(token, owner, spender)`, query with `ORDER BY block_num DESC, log_idx DESC LIMIT 1`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `owner` | `String` | Approving address (token holder) |
+| `spender` | `String` | Approved spender |
+| `amount` | `UInt256` | Allowance set on this event |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT owner, spender, toString(amount) AS amount, block_num
+    FROM token_approvals
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
+```
+
+```json
+{"ok":true,"columns":["owner","spender","amount","block_num"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","115792089237316195423570985008687907853269984665640564039457584007913129639935",1083],
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0",1071],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","500",1042]
+]}
+```
+
+#### token_approvals_current
+
+> [!NOTE]
+> View over `token_approvals FINAL`, `argMax` per `(token, owner, spender)`.
+
+Current allowance per `(token, owner, spender)` — collapses `token_approvals` history down to the last set value, filtered to `amount > 0`. Cheap lookup for "what can `spender` move on behalf of `owner`?"
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `owner` | `String` | Approving address |
+| `spender` | `String` | Approved spender |
+| `amount` | `UInt256` | Latest allowance for the pair |
+| `last_block_num` | `Int64` | Block of the latest `Approval` event |
+| `last_block_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of that event |
+| `last_tx_hash` | `String` | Transaction hash of that event |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT spender, toString(amount) AS amount, last_block_num
+    FROM token_approvals_current
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+      AND owner = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY amount DESC"
+```
+
+#### token_balances
+
+> [!NOTE]
+> View over `token_holder_deltas FINAL`, always reflects the post-merge state.
+
+Current positive balance per `(token, holder)`, rolled up from `token_holder_deltas`. Filtered to `balance > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address |
+| `balance` | `Int256` | Current balance (positive only) |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT holder, toString(balance) AS balance
+    FROM token_balances
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY balance DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["holder","balance"],"rows":[
+  ["0x70997970c51812dc3a010c7d01b50e0d17dc79c8","68056473384187692692674921486353642324"],
+  ["0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","68056473384187692692674921486353642370"],
+  ["0x15d34aaf54267db7d7c367839aaf71a00a2c6a65","68056473384187692692674921486353642328"],
+  ["0x90f79bf6eb2c4f870365e785982e1f101e93b906","68056473384187692692674921486353642286"],
+  ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266","68056473384187692692674921486353642272"]
+]}
+```
+
+#### token_holder_deltas
+
+> [!NOTE]
+> Materialized view over `token_transfers`, kept in sync on reorg.
+
+Two rows per transfer (recipient `leg=+1`, sender `leg=-1`); skips zero-address legs. `ReplacingMergeTree` deduplicates by `(token, holder, block_num, tx_hash, log_idx, leg)` so retried inserts collapse on merge.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_hash` | `String` | Transaction hash |
+| `log_idx` | `Int32` | Log index |
+| `token` | `String` | Token contract |
+| `holder` | `String` | Holder address (sender or recipient) |
+| `leg` | `Int8` | `+1` for recipient credit, `-1` for sender debit |
+| `balance_delta` | `Int256` | Signed delta applied to `holder` for `token` at this block |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT block_num, toString(balance_delta) AS delta, leg
+    FROM token_holder_deltas
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+      AND holder = '0x70997970c51812dc3a010c7d01b50e0d17dc79c8'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["block_num","delta","leg"],"rows":[
+  [1062,"-17431",-1],
+  [1059,"42",1],
+  [1051,"-180",-1],
+  [1043,"500",1],
+  [1027,"-23",-1]
+]}
+```
+
+To reconstruct a holder's balance at block `N`:
+
+```sql
+SELECT sum(balance_delta)
+FROM token_holder_deltas FINAL
+WHERE token = '0x…' AND holder = '0x…' AND block_num <= 1050
+```
+
+#### token_metadata
+
+> [!NOTE]
+> View over `token_transfers FINAL`, aggregated per `token`.
+
+Discovery / activity rollup per token contract. Every token that has ever emitted a `Transfer` shows up here with first/last seen block and timestamp plus a lifetime transfer count. Pair with a verified-tokens allowlist at query time to power `/tokens` listings.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `first_seen_block` | `Int64` | Block of the first observed `Transfer` |
+| `last_seen_block` | `Int64` | Block of the most recent `Transfer` |
+| `first_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the first `Transfer` |
+| `last_seen_timestamp` | `DateTime64(3, 'UTC')` | Timestamp of the most recent `Transfer` |
+| `transfer_count` | `UInt64` | Total `Transfer` events ever emitted by this token |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, transfer_count, first_seen_block, last_seen_block
+    FROM token_metadata
+    ORDER BY transfer_count DESC
+    LIMIT 5"
+```
+
+#### token_supply
+
+> [!NOTE]
+> View over `token_transfers FINAL`, computes net mints minus burns from zero-address legs.
+
+Outstanding supply per token, derived from `Transfer` events whose sender or recipient is `0x0`. Mints (`from = 0x0`) add to supply, burns (`to = 0x0`) subtract. Filtered to `supply > 0`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `token` | `String` | Token contract |
+| `supply` | `Int256` | Cumulative mints − cumulative burns |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, toString(supply) AS supply
+    FROM token_supply
+    ORDER BY supply DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["token","supply"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","340282366920938463463374607431768211455"],
+  ["0x20c0000000000000000000003f9a1b2c4d5e6f70","100000000000000000000000"]
+]}
+```
+
+#### token_transfer_stats
+
+> [!NOTE]
+> View over `token_transfers FINAL`, aggregated per `(day, token)`.
+
+Per-day per-token rollups of transfer activity. Aggregated at query time so reorgs and retries are inherited from the underlying `token_transfers` table.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `day` | `Date` | Day (UTC) bucket from `block_timestamp` |
+| `token` | `String` | Token contract |
+| `transfer_count` | `UInt64` | Number of `Transfer` events on that day |
+| `volume` | `UInt256` | Sum of `amount` across all transfers on that day |
+| `unique_senders` | `UInt64` | Distinct `from` addresses on that day |
+| `unique_recipients` | `UInt64` | Distinct `to` addresses on that day |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT day, transfer_count, toString(volume) AS volume, unique_senders, unique_recipients
+    FROM token_transfer_stats
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY day DESC
+    LIMIT 5"
+```
+
+```json
+{"ok":true,"columns":["day","transfer_count","volume","unique_senders","unique_recipients"],"rows":[
+  ["2026-05-27",18342,"984320012345678901234567",1024,987],
+  ["2026-05-26",17211,"872100012345678901234567",1011,973],
+  ["2026-05-25",16982,"851234012345678901234567",998,961]
+]}
+```
+
+#### token_transfers
+
+> [!NOTE]
+> Materialized view over `logs`, kept in sync on reorg.
+
+One row per canonical `Transfer(address,address,uint256)` log, decoded at insert time. `ReplacingMergeTree` keyed on `(token, block_num, log_idx, tx_hash)`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_num` | `Int64` | Block number |
+| `block_timestamp` | `DateTime64(3, 'UTC')` | Block timestamp |
+| `tx_idx` | `Int32` | Transaction index |
+| `log_idx` | `Int32` | Log index |
+| `tx_hash` | `String` | Transaction hash |
+| `token` | `String` | Emitting token contract |
+| `from` | `String` | Sender address |
+| `to` | `String` | Recipient address |
+| `amount` | `UInt256` | Transfer amount |
+| `is_virtual_forward` | `UInt8` | 1 if this transfer was inserted via a virtual-forward path |
+
+```bash
+curl -G "https://tidx.example.com/query" \
+  --data-urlencode "chainId=42431" \
+  --data-urlencode "engine=clickhouse" \
+  --data-urlencode "sql=SELECT token, \`from\`, \`to\`, toString(amount) AS amount, tx_hash
+    FROM token_transfers
+    WHERE token = '0x20c000000000000000000000e65cb5a40b7885ae'
+    ORDER BY block_num DESC, log_idx DESC
+    LIMIT 3"
+```
+
+```json
+{"ok":true,"columns":["token","from","to","amount","tx_hash"],"rows":[
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","0xfeec000000000000000000000000000000000000","17431","0x9d…ab"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","0x70997970c51812dc3a010c7d01b50e0d17dc79c8","42","0x77…3c"],
+  ["0x20c000000000000000000000e65cb5a40b7885ae","0x90f79bf6eb2c4f870365e785982e1f101e93b906","0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc","99","0x12…ef"]
+]}
+```
 
 ## Sync Architecture
 
@@ -608,5 +1062,3 @@ make clean             Stop services and clean
 ## Acknowledgments
 
 - [golden-axe](https://github.com/indexsupply/golden-axe) — Inspiration for everything.
-
-

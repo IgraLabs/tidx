@@ -5,24 +5,31 @@
 
 use anyhow::{Result, anyhow};
 use clickhouse::Row;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::clickhouse_schema::{
+    BackfillPolicy, ClickHouseObject, ClickHouseObjectKind, base_objects, derived_backfills,
+    derived_objects, migrations, reorg_tables,
+};
 use crate::metrics;
 use crate::types::{BlockRow, LogRow, ReceiptRow, TxRow};
 
-/// Schema SQL files embedded at compile time.
-const BLOCKS_SCHEMA: &str = include_str!("../../db/clickhouse/blocks.sql");
-const TXS_SCHEMA: &str = include_str!("../../db/clickhouse/txs.sql");
-const LOGS_SCHEMA: &str = include_str!("../../db/clickhouse/logs.sql");
-const LOGS_MIGRATION_20260416: &str =
-    include_str!("../../db/clickhouse/migrations/20260416_add_is_virtual_forward.sql");
-const LOGS_MIGRATION_20260417: &str =
-    include_str!("../../db/clickhouse/migrations/20260417_add_logs_virtual_forward_index.sql");
-const BLOCKS_MIGRATION_20260430: &str =
-    include_str!("../../db/clickhouse/migrations/20260430_add_blocks_consensus_proposer.sql");
-const RECEIPTS_SCHEMA: &str = include_str!("../../db/clickhouse/receipts.sql");
+/// DDL for the catalog state table that records the checksum of every
+/// migration / view / materialized view the sink has applied. Used to detect
+/// definition drift on subsequent `ensure_schema()` calls.
+const SCHEMA_OBJECTS_TABLE_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS tidx_schema_objects (
+        name       String,
+        checksum   String,
+        kind       String,
+        applied_at DateTime DEFAULT now()
+    ) ENGINE = ReplacingMergeTree(applied_at)
+    ORDER BY name
+";
 
 /// Max rows per ClickHouse INSERT to avoid unbounded memory growth during backfills.
 const CH_INSERT_CHUNK_SIZE: usize = 10_000;
@@ -82,7 +89,18 @@ impl ClickHouseSink {
         })
     }
 
-    /// Create database and tables if they don't exist.
+    /// Reconcile the ClickHouse schema:
+    ///
+    /// 1. Create the database and base tables (idempotent).
+    /// 2. Apply migrations once, tracking their checksum in
+    ///    `tidx_schema_objects`. A modified migration body fails loudly rather
+    ///    than silently skipping or replaying.
+    /// 3. Reconcile derived views / materialized views: if a definition's
+    ///    checksum has changed since the last `ensure_schema()`, drop and
+    ///    recreate it so SELECT-body edits actually take effect.
+    /// 4. One-shot backfill any derived table whose target is empty. The
+    ///    caller MUST guarantee no concurrent writers — the indexer enforces
+    ///    this by running `ensure_schema()` at startup before any sink writes.
     pub async fn ensure_schema(&self) -> Result<()> {
         self.base_client
             .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
@@ -90,41 +108,199 @@ impl ClickHouseSink {
             .await
             .map_err(|e| anyhow!("Failed to create ClickHouse database: {e}"))?;
 
-        for (name, ddl) in [
-            ("blocks", BLOCKS_SCHEMA),
-            ("txs", TXS_SCHEMA),
-            ("logs", LOGS_SCHEMA),
-            ("receipts", RECEIPTS_SCHEMA),
-        ] {
+        for object in base_objects() {
+            let ddl = object.ddl();
             self.client
-                .query(ddl)
+                .query(&ddl)
                 .execute()
                 .await
-                .map_err(|e| anyhow!("Failed to create ClickHouse table {name}: {e}"))?;
-            debug!(table = name, database = %self.database, "ClickHouse table ready");
+                .map_err(|e| anyhow!("Failed to create ClickHouse table {}: {e}", object.name))?;
+            debug!(table = object.name, database = %self.database, "ClickHouse table ready");
         }
 
-        self.client
-            .query(LOGS_MIGRATION_20260416)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260416: {e}"))?;
+        self.ensure_schema_objects_table().await?;
+        let mut tracking = self.load_applied_checksums().await?;
 
-        self.client
-            .query(LOGS_MIGRATION_20260417)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse logs migration 20260417: {e}"))?;
+        for migration in migrations() {
+            self.apply_migration(migration, &mut tracking).await?;
+        }
 
-        // TIP-1031: ed25519 consensus proposer pubkey on blocks.
-        self.client
-            .query(BLOCKS_MIGRATION_20260430)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Failed to run ClickHouse blocks migration 20260430: {e}"))?;
+        self.ensure_derived_objects(&mut tracking).await?;
 
         info!(database = %self.database, "ClickHouse schema ready");
         Ok(())
+    }
+
+    async fn ensure_schema_objects_table(&self) -> Result<()> {
+        self.client
+            .query(SCHEMA_OBJECTS_TABLE_DDL)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to create tidx_schema_objects: {e}"))?;
+        Ok(())
+    }
+
+    async fn load_applied_checksums(&self) -> Result<HashMap<String, String>> {
+        let rows: Vec<ChSchemaObjectRow> = self
+            .client
+            .query("SELECT name, checksum FROM tidx_schema_objects FINAL")
+            .fetch_all()
+            .await
+            .map_err(|e| anyhow!("Failed to load tidx_schema_objects: {e}"))?;
+        Ok(rows.into_iter().map(|r| (r.name, r.checksum)).collect())
+    }
+
+    async fn apply_migration(
+        &self,
+        migration: &ClickHouseObject,
+        tracking: &mut HashMap<String, String>,
+    ) -> Result<()> {
+        let checksum = checksum_of(&migration.ddl());
+        if let Some(applied) = tracking.get(migration.name) {
+            if applied != &checksum {
+                return Err(anyhow!(
+                    "ClickHouse migration {} has been modified since it was applied \
+                     (recorded checksum {} != current {}). Migrations are append-only; \
+                     add a new migration instead of editing the existing one.",
+                    migration.name,
+                    applied,
+                    checksum
+                ));
+            }
+            return Ok(());
+        }
+
+        self.client
+            .query(&migration.ddl())
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to run ClickHouse migration {}: {e}", migration.name))?;
+        self.record_applied(migration.name, &checksum, "migration")
+            .await?;
+        tracking.insert(migration.name.to_string(), checksum);
+        Ok(())
+    }
+
+    async fn ensure_derived_objects(&self, tracking: &mut HashMap<String, String>) -> Result<()> {
+        for object in derived_objects() {
+            let ddl = object.ddl();
+            let checksum = checksum_of(&ddl);
+            let needs_recreate = match tracking.get(object.name) {
+                Some(applied) => applied != &checksum,
+                None => false,
+            };
+
+            if needs_recreate {
+                if let Some(drop_sql) = object.drop_sql() {
+                    warn!(
+                        object = object.name,
+                        "ClickHouse derived object definition changed; dropping and re-creating. \
+                         Historical rows in the target table still reflect the OLD definition — \
+                         add a migration to truncate + rebackfill if you need them rewritten."
+                    );
+                    self.client.query(&drop_sql).execute().await.map_err(|e| {
+                        anyhow!("Failed to drop ClickHouse object {}: {e}", object.name)
+                    })?;
+                }
+            }
+
+            self.client
+                .query(&ddl)
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to create ClickHouse object {}: {e}", object.name))?;
+
+            let kind_label = match object.kind {
+                ClickHouseObjectKind::Table(_) => "table",
+                ClickHouseObjectKind::View(_) => "view",
+                ClickHouseObjectKind::MaterializedView { .. } => "materialized_view",
+                ClickHouseObjectKind::Migration(_) => "migration",
+            };
+            self.record_applied(object.name, &checksum, kind_label)
+                .await?;
+            tracking.insert(object.name.to_string(), checksum);
+            debug!(object = object.name, database = %self.database, "ClickHouse object ready");
+        }
+
+        self.backfill_derived_objects_if_empty().await
+    }
+
+    async fn record_applied(&self, name: &str, checksum: &str, kind: &str) -> Result<()> {
+        // ReplacingMergeTree on (name) collapses prior entries during merges.
+        // All inputs are catalog-controlled (object names, hex checksums,
+        // kind labels) so direct interpolation is safe.
+        let sql = format!(
+            "INSERT INTO tidx_schema_objects (name, checksum, kind) VALUES ('{}', '{}', '{}')",
+            name, checksum, kind
+        );
+        self.client
+            .query(&sql)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("Failed to record schema object {name}: {e}"))?;
+        Ok(())
+    }
+
+    /// Snapshot-guarded one-shot backfill. The `IfEmpty` policy only runs the
+    /// backfill INSERT when the target is empty AND `logs` did not advance
+    /// during the operation (which would indicate a concurrent writer — the
+    /// race that `POPULATE` is famous for in ClickHouse).
+    async fn backfill_derived_objects_if_empty(&self) -> Result<()> {
+        for object in derived_backfills() {
+            let Some(BackfillPolicy::IfEmpty { select_sql }) = object.backfill else {
+                continue;
+            };
+            let count: u64 = self
+                .client
+                .query(&format!("SELECT count() FROM {}", object.name))
+                .fetch_one()
+                .await
+                .map_err(|e| anyhow!("Failed to count ClickHouse table {}: {e}", object.name))?;
+            if count > 0 {
+                continue;
+            }
+
+            let before = self.logs_watermark().await?;
+
+            self.client
+                .query(&format!("INSERT INTO {} {}", object.name, select_sql))
+                .execute()
+                .await
+                .map_err(|e| anyhow!("Failed to backfill ClickHouse table {}: {e}", object.name))?;
+
+            let after = self.logs_watermark().await?;
+            if before != after {
+                return Err(anyhow!(
+                    "ClickHouse backfill of {} raced with a concurrent writer: \
+                     logs watermark advanced from {:?} to {:?} during the backfill. \
+                     Rebuild the derived table with no other writers active.",
+                    object.name,
+                    before,
+                    after
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn logs_watermark(&self) -> Result<Option<i64>> {
+        let count: u64 = self
+            .client
+            .query("SELECT count() FROM logs")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let max: i64 = self
+            .client
+            .query("SELECT max(block_num) FROM logs")
+            .fetch_one()
+            .await
+            .map_err(|e| anyhow!("ClickHouse query failed: {e}"))?;
+        Ok(Some(max))
     }
 
     pub fn name(&self) -> &'static str {
@@ -220,15 +396,12 @@ impl ClickHouseSink {
     }
 
     /// Query the highest block number for a specific table.
-    /// Uses "num" for blocks table, "block_num" for others.
+    /// Uses the block column declared in the ClickHouse schema registry.
     /// Returns None if the table is empty.
     pub async fn max_block_in_table(&self, table: &str) -> Result<Option<i64>> {
         let table = validate_table_name(table)?;
-        let col = if table == "blocks" {
-            "num"
-        } else {
-            "block_num"
-        };
+        let col = crate::clickhouse_schema::block_column(table)
+            .ok_or_else(|| anyhow!("ClickHouse table has no block column: {table}"))?;
         let count: u64 = self
             .client
             .query(&format!("SELECT count() FROM {table}"))
@@ -258,16 +431,18 @@ impl ClickHouseSink {
     }
 
     /// Delete all data from a given block number onwards (reorg support).
+    ///
+    /// Uses `mutations_sync=1` so the ALTER ... DELETE completes before this
+    /// returns, then asserts the affected range is actually empty before
+    /// moving to the next table. This catches the case where a mutation
+    /// silently fails (or where a replicated cluster reports synchronous
+    /// completion but a replica still serves stale rows) — without the
+    /// assertion, replay would happily start atop ghost rows.
     pub async fn delete_from(&self, block_num: u64) -> Result<()> {
-        let tables = ["logs", "receipts", "txs", "blocks"];
-        let block_col = |t: &str| if t == "blocks" { "num" } else { "block_num" };
-
-        for table in &tables {
+        for table in reorg_tables() {
             let sql = format!(
                 "ALTER TABLE {} DELETE WHERE {} >= {}",
-                table,
-                block_col(table),
-                block_num
+                table.name, table.block_column, block_num
             );
             self.client
                 .query(&sql)
@@ -275,9 +450,32 @@ impl ClickHouseSink {
                 .execute()
                 .await
                 .map_err(|e| {
-                    error!(table = *table, error = %e, "ClickHouse delete failed");
-                    anyhow!("ClickHouse delete from {table} failed: {e}")
+                    error!(table = table.name, error = %e, "ClickHouse delete failed");
+                    anyhow!("ClickHouse delete from {} failed: {e}", table.name)
                 })?;
+
+            let remaining: u64 = self
+                .client
+                .query(&format!(
+                    "SELECT count() FROM {} WHERE {} >= {}",
+                    table.name, table.block_column, block_num
+                ))
+                .fetch_one()
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "ClickHouse reorg verification query for {} failed: {e}",
+                        table.name
+                    )
+                })?;
+            if remaining > 0 {
+                return Err(anyhow!(
+                    "ClickHouse reorg delete on {} left {remaining} row(s) at \
+                     {} >= {block_num}; refusing to replay atop stale rows",
+                    table.name,
+                    table.block_column
+                ));
+            }
         }
 
         debug!(from_block = block_num, "ClickHouse reorg delete complete");
@@ -341,6 +539,12 @@ impl ClickHouseSink {
 //
 // These derive `clickhouse::Row` for RowBinary serialization and `serde::Serialize`
 // for the Row encoding. DateTime64(3) columns use the chrono serde adapter.
+
+#[derive(Row, Deserialize)]
+struct ChSchemaObjectRow {
+    name: String,
+    checksum: String,
+}
 
 #[derive(Row, Serialize)]
 struct ChBlockWire {
@@ -514,16 +718,20 @@ fn hex_encode(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-/// Known table names that are safe to interpolate into SQL.
-const KNOWN_TABLES: &[&str] = &["blocks", "txs", "logs", "receipts"];
+/// Stable non-cryptographic checksum of a DDL string. Used only to detect
+/// whether a managed object's definition has drifted since the last
+/// `ensure_schema()`. Collisions are not security-relevant here.
+fn checksum_of(ddl: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    ddl.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 /// Validate that a table name is one of the known tables.
 /// Returns the validated name or an error for unknown tables.
 fn validate_table_name(table: &str) -> Result<&str> {
-    KNOWN_TABLES
-        .iter()
-        .find(|&&t| t == table)
-        .copied()
+    crate::clickhouse_schema::is_known_table(table)
+        .then_some(table)
         .ok_or_else(|| anyhow!("Unknown ClickHouse table: {table}"))
 }
 
@@ -620,5 +828,12 @@ mod tests {
         );
         assert!(ClickHouseSink::new("http://localhost:8123", "123bad", None, None).is_err());
         assert!(ClickHouseSink::new("http://localhost:8123", "", None, None).is_err());
+    }
+
+    #[test]
+    fn test_token_holder_deltas_table_is_known() {
+        assert!(validate_table_name("token_transfers").is_ok());
+        assert!(validate_table_name("token_holder_deltas").is_ok());
+        assert!(validate_table_name("token_balances").is_ok());
     }
 }
